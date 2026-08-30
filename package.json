@@ -1,0 +1,27 @@
+{
+  "name": "youzaiworld-service-status",
+  "type": "module",
+  "private": true,
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "deploy": "pnpm build && wrangler deploy",
+    "postinstall": "nuxt prepare",
+    "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
+    "typecheck": "nuxt typecheck"
+  },
+  "dependencies": {
+    "lucide-vue-next": "^0.468.0",
+    "nuxt": "^4.4.8",
+    "vue": "^3.5.39",
+    "vue-router": "^5.1.0"
+  },
+  "devDependencies": {
+    "sass": "^1.83.4",
+    "typescript": "^5.9.3",
+    "vue-tsc": "^3.2.2",
+    "wrangler": "^4.125.0"
+  }
+}
+
