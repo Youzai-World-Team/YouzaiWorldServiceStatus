@@ -1,0 +1,2 @@
+# YouzaiWorldServiceStatus
+悠哉世界服务可用性检查
