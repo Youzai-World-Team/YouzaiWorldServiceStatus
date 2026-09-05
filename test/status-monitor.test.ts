@@ -3,9 +3,11 @@ import test from 'node:test'
 import type { MinecraftStatus, NodeStatus, ServiceStatus } from '../shared/status.ts'
 import {
   deriveOverallStatus,
+  fetchWithRetry,
   normalizeHistoryResponse,
   normalizeMinecraftResponse,
   normalizeNodeResponse,
+  recoverTransientFailures,
 } from '../server/utils/status-monitor.ts'
 import { historyPoints } from '../server/utils/status-db.ts'
 
@@ -135,4 +137,91 @@ test('五分钟样本会聚合为覆盖完整区间的图表点', () => {
   assert.equal(points.length, 96)
   assert.equal(points[0]?.status, 'offline')
   assert.equal(points.at(-1)?.time, samples.at(-1)?.capturedAt)
+})
+
+test('网络抖动时会在总时限内重试一次', async () => {
+  const originalFetch = globalThis.fetch
+  let attempts = 0
+  globalThis.fetch = (async () => {
+    attempts += 1
+    if (attempts === 1) throw new TypeError('fetch failed')
+    return new Response('ok', { status: 200 })
+  }) as typeof fetch
+
+  try {
+    const response = await fetchWithRetry('https://status.example.test')
+    assert.equal(response.status, 200)
+    assert.equal(attempts, 2)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('上游 5xx 时会重试并返回后续成功响应', async () => {
+  const originalFetch = globalThis.fetch
+  let attempts = 0
+  globalThis.fetch = (async () => {
+    attempts += 1
+    return attempts === 1
+      ? new Response('temporary failure', { status: 503 })
+      : new Response('ok', { status: 200 })
+  }) as typeof fetch
+
+  try {
+    const response = await fetchWithRetry('https://status.example.test')
+    assert.equal(response.status, 200)
+    assert.equal(attempts, 2)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('单次瞬时失败会沿用最近一次成功状态并标记过期', () => {
+  const previous: any = {
+    generatedAt: 1_800_000_000_000,
+    refreshAfterMs: 60_000,
+    overall: 'operational',
+    services: [{
+      id: 'website', name: '官网', description: 'mcyzw.top', url: 'https://mcyzw.top/',
+      status: 'operational', latencyMs: 120, httpStatus: 200, checkedAt: 1_800_000_000_000, message: '运行正常',
+    }],
+    node: {
+      name: 'EQAD-003', status: 'operational', timestamp: 1_800_000_000_000,
+      systemType: 'Linux', cpuUsage: 10, memoryUsage: 20, message: '运行正常',
+    },
+    minecraft: {
+      address: 'play.mcyzw.top:25565', status: 'operational', online: true,
+      playersOnline: 1, playersMax: 80, version: '1.21.8', protocol: '772', latencyMs: 30, message: '服务在线',
+    },
+    history: [],
+    errors: {},
+  }
+  const current = {
+    ...previous,
+    generatedAt: 1_800_000_030_000,
+    overall: 'outage' as const,
+    services: [{ ...previous.services[0], status: 'outage' as const, latencyMs: null, httpStatus: null, message: '响应超时' }],
+    errors: { node: '响应超时', minecraft: '响应超时' },
+    node: { ...previous.node, status: 'unknown' as const, timestamp: null, message: '响应超时' },
+    minecraft: { ...previous.minecraft, status: 'unknown' as const, online: false, message: '响应超时' },
+  }
+
+  const recovered = recoverTransientFailures(current, previous, 1_800_000_030_000)
+  assert.equal(recovered.stale, true)
+  assert.equal(recovered.services[0]?.status, 'operational')
+  assert.equal(recovered.node.status, 'operational')
+  assert.equal(recovered.minecraft.status, 'operational')
+  assert.equal(recovered.overall, 'operational')
+  assert.match(recovered.errors.worker || '', /瞬时网络失败/)
+
+  const persistent = recoverTransientFailures(current, {
+    ...previous,
+    services: current.services,
+    node: current.node,
+    minecraft: current.minecraft,
+  }, 1_800_000_030_000)
+  assert.equal(persistent.stale, undefined)
+  assert.equal(persistent.services[0]?.status, 'outage')
+  assert.equal(persistent.node.status, 'unknown')
+  assert.equal(persistent.minecraft.status, 'unknown')
 })

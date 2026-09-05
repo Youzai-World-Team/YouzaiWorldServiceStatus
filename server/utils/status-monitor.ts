@@ -22,10 +22,13 @@ const MINECRAFT_HOST = 'play.mcyzw.top'
 const MINECRAFT_PORT = 25565
 const MAX_HISTORY_POINTS = 96
 const REQUEST_TIMEOUT_MS = 8_000
+const REQUEST_ATTEMPTS = 2
+const RETRY_DELAY_MS = 150
 const REFRESH_AFTER_MS = 60_000
 const CACHE_MAX_AGE_MS = 30_000
 const DEGRADED_LATENCY_MS = 2_500
 const NODE_STALE_AFTER_MS = 10 * 60 * 1000
+const TRANSIENT_FAILURE_GRACE_MS = 6 * 60 * 1000
 
 interface ServiceDefinition {
   id: ServiceStatus['id']
@@ -108,19 +111,66 @@ function errorMessage(error: unknown, fallback: string): string {
   const name = error instanceof Error ? error.name : ''
   const message = error instanceof Error ? error.message : ''
   if (name === 'TimeoutError' || name === 'AbortError') return '响应超时'
+  if (name === 'TypeError') return '无法连接服务'
   if (/^HTTP \d+$/.test(message)) return `返回异常状态 ${message.slice(5)}`
   return fallback
 }
 
+function retryableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500
+}
+
+function retryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return true
+  return error.name === 'AbortError'
+    || error.name === 'TimeoutError'
+    || error.name === 'TypeError'
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+/**
+ * Edge-to-origin connections can fail transiently. Retry only network-like
+ * failures and explicitly retryable HTTP statuses, while keeping the whole
+ * operation bounded by REQUEST_TIMEOUT_MS.
+ */
+export async function fetchWithRetry(url: string, init: RequestInit = {}): Promise<Response> {
+  const attemptTimeout = Math.max(1, Math.floor((REQUEST_TIMEOUT_MS - RETRY_DELAY_MS) / REQUEST_ATTEMPTS))
+  let lastError: unknown = new Error('请求失败')
+
+  for (let attempt = 0; attempt < REQUEST_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), attemptTimeout)
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      })
+      if (attempt === REQUEST_ATTEMPTS - 1 || !retryableStatus(response.status)) return response
+      lastError = new Error(`HTTP ${response.status}`)
+      if (response.body && !response.body.locked) void response.body.cancel()
+    } catch (error) {
+      lastError = error
+      if (attempt === REQUEST_ATTEMPTS - 1 || !retryableError(error)) throw error
+    } finally {
+      clearTimeout(timeout)
+    }
+    await wait(RETRY_DELAY_MS)
+  }
+
+  throw lastError
+}
+
 async function requestJson(url: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     ...init,
     headers: {
       Accept: 'application/json',
       'User-Agent': 'YouzaiWorld-ServiceStatus/1.0',
       ...init?.headers,
     },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   return response.json()
@@ -204,13 +254,12 @@ async function checkService(definition: ServiceDefinition): Promise<ServiceStatu
   }
   let response: Response | null = null
   try {
-    response = await fetch(definition.url, {
+    response = await fetchWithRetry(definition.url, {
       headers: {
         Accept: '*/*',
         'User-Agent': 'YouzaiWorld-ServiceStatus/1.0',
       },
       redirect: 'follow',
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     const latencyMs = Math.max(0, Math.round(performance.now() - startedAt))
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -236,6 +285,98 @@ async function checkService(definition: ServiceDefinition): Promise<ServiceStatu
     }
   } finally {
     if (response?.body && !response.body.locked) void response.body.cancel()
+  }
+}
+
+function isTransientFailureMessage(message: unknown): boolean {
+  if (typeof message !== 'string') return false
+  return message === '响应超时'
+    || message === '无法连接服务'
+    || /^返回异常状态 (408|425|429|5\d\d)$/.test(message)
+}
+
+function isFreshSnapshot(snapshot: StatusSnapshot, now: number): boolean {
+  const age = now - snapshot.generatedAt
+  return age >= 0 && age <= TRANSIENT_FAILURE_GRACE_MS
+}
+
+function hasTransientFailures(snapshot: StatusSnapshot): boolean {
+  return snapshot.services.some((service) => service.status === 'outage' && isTransientFailureMessage(service.message))
+    || snapshot.node.status === 'unknown'
+    || snapshot.minecraft.status === 'unknown'
+}
+
+/**
+ * A single failed probe should not make a healthy service appear offline. The
+ * raw failed snapshot is still persisted for history; this only controls the
+ * response shown to users until the next successful probe or grace period.
+ */
+export function recoverTransientFailures(
+  snapshot: StatusSnapshot,
+  previous: StatusSnapshot | null,
+  now = Date.now(),
+): StatusSnapshot {
+  if (!previous || !isFreshSnapshot(previous, now)) return snapshot
+
+  let recovered = false
+  const recoveredNames: string[] = []
+  const services = snapshot.services.map((service) => {
+    const prior = previous.services.find((item) => item.id === service.id)
+    if (
+      !prior
+      || (prior.status !== 'operational' && prior.status !== 'degraded')
+      || service.status !== 'outage'
+      || !isTransientFailureMessage(service.message)
+    ) return service
+    recovered = true
+    recoveredNames.push(service.name)
+    return {
+      ...service,
+      status: prior.status,
+      latencyMs: prior.latencyMs,
+      httpStatus: prior.httpStatus,
+      checkedAt: now,
+      message: `本次检测失败，沿用最近一次成功状态（${service.message}）`,
+    }
+  })
+
+  let node = snapshot.node
+  if (snapshot.node.status === 'unknown' && isTransientFailureMessage(snapshot.errors.node)) {
+    if (previous.node.status === 'operational' || previous.node.status === 'degraded') {
+      recovered = true
+      recoveredNames.push('运行节点')
+      node = {
+        ...previous.node,
+        message: `本次检测失败，沿用最近一次成功状态（${snapshot.errors.node}）`,
+      }
+    }
+  }
+
+  let minecraft = snapshot.minecraft
+  if (snapshot.minecraft.status === 'unknown' && isTransientFailureMessage(snapshot.errors.minecraft)) {
+    if (previous.minecraft.status === 'operational' || previous.minecraft.status === 'degraded') {
+      recovered = true
+      recoveredNames.push('Minecraft 游戏服务')
+      minecraft = {
+        ...previous.minecraft,
+        message: `本次检测失败，沿用最近一次成功状态（${snapshot.errors.minecraft}）`,
+      }
+    }
+  }
+
+  if (!recovered) return snapshot
+  const errors = { ...snapshot.errors }
+  delete errors.node
+  delete errors.minecraft
+  errors.worker = `本次检测存在瞬时网络失败，已沿用最近一次成功状态：${recoveredNames.join('、')}`
+  return {
+    ...snapshot,
+    services,
+    node,
+    minecraft,
+    overall: deriveOverallStatus(services, node, minecraft),
+    errors,
+    stale: true,
   }
 }
 
@@ -308,16 +449,25 @@ export async function getStatusSnapshot(force = false, source?: unknown): Promis
 
   pendingSnapshot = collectStatusSnapshot()
     .then(async (snapshot) => {
+      let previous = cachedSnapshot?.stale ? null : cachedSnapshot
+      if (hasTransientFailures(snapshot) && (!previous || !isFreshSnapshot(previous, Date.now()))) {
+        try {
+          previous = await getLatestStatusSnapshot(source)
+        } catch {
+          previous = null
+        }
+      }
+      const displaySnapshot = recoverTransientFailures(snapshot, previous)
       try {
         await saveStatusSnapshot(snapshot, source)
-        snapshot.history = historyPoints(await getStatusHistory(source, 24), MAX_HISTORY_POINTS)
+        displaySnapshot.history = historyPoints(await getStatusHistory(source, 24), MAX_HISTORY_POINTS)
       } catch (error) {
-        snapshot.errors.storage = errorMessage(error, '状态历史存储暂不可用')
-        snapshot.history = historyPoints(getMemoryStatusHistory(24), MAX_HISTORY_POINTS)
+        displaySnapshot.errors.storage = errorMessage(error, '状态历史存储暂不可用')
+        displaySnapshot.history = historyPoints(getMemoryStatusHistory(24), MAX_HISTORY_POINTS)
       }
-      cachedSnapshot = snapshot
+      cachedSnapshot = displaySnapshot
       cachedAt = Date.now()
-      return snapshot
+      return displaySnapshot
     })
     .catch(async (error) => {
       // A fully failed collection is uncommon because individual probes settle
