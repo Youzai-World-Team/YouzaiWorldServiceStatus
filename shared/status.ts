@@ -47,6 +47,15 @@ export interface StatusSnapshot {
   node: NodeStatus
   minecraft: MinecraftStatus
   history: AvailabilityPoint[]
-  errors: Partial<Record<'node' | 'minecraft' | 'history', string>>
+  errors: Partial<Record<'node' | 'minecraft' | 'history' | 'storage' | 'worker', string>>
+  stale?: boolean
 }
 
+export interface StatusHistorySample {
+  capturedAt: number
+  overall: StatusTone
+  services: ServiceStatus[]
+  node: NodeStatus
+  minecraft: MinecraftStatus
+  errors: Partial<Record<'node' | 'minecraft' | 'storage', string>>
+}

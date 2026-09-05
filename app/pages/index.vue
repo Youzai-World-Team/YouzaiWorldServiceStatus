@@ -174,6 +174,11 @@ onBeforeUnmount(() => {
       {{ requestError }}
     </div>
 
+    <div v-if="snapshot?.stale" class="content-container transient-error" role="status">
+      <TriangleAlert :size="18" aria-hidden="true" />
+      {{ snapshot.errors.worker || '实时检测暂不可用，当前显示最近一次历史数据。' }}
+    </div>
+
     <div v-if="pending && !snapshot" class="content-container loading-state" aria-live="polite">
       <RefreshCw :size="26" class="spinning" aria-hidden="true" />
       <span>正在汇总服务状态...</span>
@@ -326,7 +331,7 @@ onBeforeUnmount(() => {
           <div class="section-heading history-heading">
             <div>
               <p class="section-kicker">Last 24 Hours</p>
-              <h2>游戏节点可用性</h2>
+              <h2>运行节点可用性</h2>
             </div>
             <strong>{{ availability === null ? '-' : `${availability.toFixed(1)}%` }}</strong>
           </div>

@@ -1,18 +1,35 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "youzaiworld-service-status",
-  "main": "./.output/server/index.mjs",
-  "compatibility_date": "2026-08-30",
-  "compatibility_flags": ["nodejs_compat"],
-  "assets": {
-    "binding": "ASSETS",
-    "directory": "./.output/public"
-  },
-  "triggers": {
-    "crons": ["*/5 * * * *"]
-  },
-  "observability": {
-    "enabled": true
-  }
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "youzaiworld-service-status",
+	"main": "./.output/server/index.mjs",
+	"compatibility_date": "2026-08-30",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"assets": {
+		"binding": "ASSETS",
+		"directory": "./.output/public"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "youzaiworld-service-status",
+			"database_id": "f0e0068e-936e-49b3-841f-641d643f7673",
+			"migrations_dir": "./migrations"
+		},
+		{
+			"binding": "youzaiworld_service_status",
+			"database_name": "youzaiworld-service-status",
+			"database_id": "f0e0068e-936e-49b3-841f-641d643f7673",
+			"remote": true
+		}
+	],
+	"triggers": {
+		"crons": [
+			"*/5 * * * *"
+		]
+	},
+	"observability": {
+		"enabled": true
+	}
 }
-

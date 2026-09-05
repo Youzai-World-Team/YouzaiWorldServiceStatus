@@ -5,8 +5,8 @@ export default defineTask({
     name: 'status:check',
     description: '定时检测悠哉世界各项服务状态',
   },
-  async run() {
-    const snapshot = await getStatusSnapshot(true)
+  async run(taskEvent) {
+    const snapshot = await getStatusSnapshot(true, taskEvent)
     const unavailable = [
       ...snapshot.services.filter((service) => service.status !== 'operational').map((service) => service.name),
       ...(snapshot.node.status !== 'operational' ? [snapshot.node.name] : []),
@@ -25,4 +25,3 @@ export default defineTask({
     }
   },
 })
-

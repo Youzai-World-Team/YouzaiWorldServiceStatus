@@ -6,9 +6,16 @@ import type {
   StatusSnapshot,
   StatusTone,
 } from '../../shared/status.ts'
+import {
+  getLatestMemoryStatusSnapshot,
+  getLatestStatusSnapshot,
+  getMemoryStatusHistory,
+  getStatusHistory,
+  historyPoints,
+  saveStatusSnapshot,
+} from './status-db.ts'
 
 const NODE_SERVICES_URL = 'https://api.eqad.fun/mcsm/api/services/'
-const HISTORY_URL = 'https://api.eqad.fun/monitor'
 const MINECRAFT_STATUS_URL = 'https://mcyzw.top/api/craftping/get_status'
 const NODE_NAME = 'EQAD-003'
 const MINECRAFT_HOST = 'play.mcyzw.top'
@@ -189,6 +196,12 @@ export function deriveOverallStatus(
 async function checkService(definition: ServiceDefinition): Promise<ServiceStatus> {
   const checkedAt = Date.now()
   const startedAt = performance.now()
+  const publicDefinition = {
+    id: definition.id,
+    name: definition.name,
+    description: definition.description,
+    url: definition.url,
+  }
   let response: Response | null = null
   try {
     response = await fetch(definition.url, {
@@ -205,7 +218,7 @@ async function checkService(definition: ServiceDefinition): Promise<ServiceStatu
     if (!valid) throw new Error('invalid response')
     const status = latencyMs > DEGRADED_LATENCY_MS ? 'degraded' : 'operational'
     return {
-      ...definition,
+      ...publicDefinition,
       status,
       latencyMs,
       httpStatus: response.status,
@@ -214,7 +227,7 @@ async function checkService(definition: ServiceDefinition): Promise<ServiceStatu
     }
   } catch (error) {
     return {
-      ...definition,
+      ...publicDefinition,
       status: 'outage',
       latencyMs: null,
       httpStatus: response?.status ?? null,
@@ -227,7 +240,7 @@ async function checkService(definition: ServiceDefinition): Promise<ServiceStatu
 }
 
 async function collectStatusSnapshot(): Promise<StatusSnapshot> {
-  const [services, nodeResult, minecraftResult, historyResult] = await Promise.all([
+  const [services, nodeResult, minecraftResult] = await Promise.all([
     settle(Promise.all(SERVICE_DEFINITIONS.map(checkService))),
     settle(requestJson(NODE_SERVICES_URL)),
     settle(requestJson(MINECRAFT_STATUS_URL, {
@@ -235,7 +248,6 @@ async function collectStatusSnapshot(): Promise<StatusSnapshot> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ host: MINECRAFT_HOST, port: MINECRAFT_PORT }),
     })),
-    settle(requestJson(HISTORY_URL, { cache: 'no-store' })),
   ])
 
   const checkedServices = services.ok ? services.value : []
@@ -277,14 +289,6 @@ async function collectStatusSnapshot(): Promise<StatusSnapshot> {
     }
   }
 
-  let history: AvailabilityPoint[] = []
-  try {
-    if (!historyResult.ok) throw historyResult.error
-    history = normalizeHistoryResponse(historyResult.value)
-  } catch (error) {
-    errors.history = errorMessage(error, error instanceof Error ? error.message : '历史监控暂不可用')
-  }
-
   return {
     generatedAt: Date.now(),
     refreshAfterMs: REFRESH_AFTER_MS,
@@ -292,21 +296,48 @@ async function collectStatusSnapshot(): Promise<StatusSnapshot> {
     services: checkedServices,
     node,
     minecraft,
-    history,
+    history: [],
     errors,
   }
 }
 
-export async function getStatusSnapshot(force = false): Promise<StatusSnapshot> {
+export async function getStatusSnapshot(force = false, source?: unknown): Promise<StatusSnapshot> {
   const now = Date.now()
   if (!force && cachedSnapshot && now - cachedAt < CACHE_MAX_AGE_MS) return cachedSnapshot
   if (pendingSnapshot) return pendingSnapshot
 
   pendingSnapshot = collectStatusSnapshot()
-    .then((snapshot) => {
+    .then(async (snapshot) => {
+      try {
+        await saveStatusSnapshot(snapshot, source)
+        snapshot.history = historyPoints(await getStatusHistory(source, 24), MAX_HISTORY_POINTS)
+      } catch (error) {
+        snapshot.errors.storage = errorMessage(error, '状态历史存储暂不可用')
+        snapshot.history = historyPoints(getMemoryStatusHistory(24), MAX_HISTORY_POINTS)
+      }
       cachedSnapshot = snapshot
       cachedAt = Date.now()
       return snapshot
+    })
+    .catch(async (error) => {
+      // A fully failed collection is uncommon because individual probes settle
+      // independently. If it does happen, keep the public status API useful by
+      // returning the most recent D1 snapshot and clearly marking it as stale.
+      let fallback: StatusSnapshot | null
+      try {
+        fallback = await getLatestStatusSnapshot(source)
+      } catch {
+        fallback = getLatestMemoryStatusSnapshot()
+      }
+      if (!fallback) throw error
+      fallback.stale = true
+      fallback.errors.worker = errorMessage(error, '实时状态检测失败，当前显示最近一次记录')
+      try {
+        fallback.history = historyPoints(await getStatusHistory(source, 24), MAX_HISTORY_POINTS)
+      } catch {
+        fallback.history = historyPoints(getMemoryStatusHistory(24), MAX_HISTORY_POINTS)
+      }
+      return fallback
     })
     .finally(() => {
       pendingSnapshot = null
