@@ -12,7 +12,6 @@ interface D1PreparedStatementLike {
 
 interface D1DatabaseLike {
   prepare(query: string): D1PreparedStatementLike
-  exec?(query: string): Promise<unknown>
 }
 
 interface CloudflareSource {
@@ -48,8 +47,10 @@ function databaseFrom(source?: unknown): D1DatabaseLike | null {
     (globalThis as typeof globalThis & { __env__?: Record<string, unknown> }).__env__,
   ]
   for (const env of environments) {
-    const db = env?.DB
-    if (db && typeof (db as D1DatabaseLike).prepare === 'function') return db as D1DatabaseLike
+    for (const binding of ['DB', 'youzaiworld_service_status']) {
+      const db = env?.[binding]
+      if (db && typeof (db as D1DatabaseLike).prepare === 'function') return db as D1DatabaseLike
+    }
   }
   return null
 }
@@ -58,22 +59,8 @@ async function ensureSchema(db: D1DatabaseLike): Promise<void> {
   const existing = schemaPromises.get(db as object)
   if (existing) return existing
   const promise = (async () => {
-    const sql = `
-      CREATE TABLE IF NOT EXISTS status_samples (
-        captured_at INTEGER PRIMARY KEY,
-        overall TEXT NOT NULL,
-        services_json TEXT NOT NULL,
-        node_json TEXT NOT NULL,
-        minecraft_json TEXT NOT NULL,
-        errors_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS status_samples_captured_idx
-        ON status_samples (captured_at DESC);
-    `
-    if (db.exec) {
-      await db.exec(sql)
-      return
-    }
+    // D1 exec() splits SQL at newlines; multiline CREATE statements must use
+    // prepare().run(), otherwise initialization fails with incomplete input.
     await db.prepare(`CREATE TABLE IF NOT EXISTS status_samples (
       captured_at INTEGER PRIMARY KEY,
       overall TEXT NOT NULL,

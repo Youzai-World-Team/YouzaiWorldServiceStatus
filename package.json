@@ -9,6 +9,7 @@
     "deploy": "pnpm build && wrangler deploy",
     "postinstall": "nuxt prepare",
     "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
+    "test:live": "node --experimental-strip-types scripts/probe-status.ts",
     "typecheck": "nuxt typecheck"
   },
   "dependencies": {
@@ -18,10 +19,10 @@
     "vue-router": "^5.1.0"
   },
   "devDependencies": {
+    "@types/node": "^24.13.4",
     "sass": "^1.83.4",
     "typescript": "^5.9.3",
     "vue-tsc": "^3.2.2",
     "wrangler": "^4.125.0"
   }
 }
-

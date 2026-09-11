@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 import type { MinecraftStatus, NodeStatus, ServiceStatus } from '../shared/status.ts'
 import {
+  collectStatusSnapshot,
   deriveOverallStatus,
   fetchWithRetry,
   normalizeHistoryResponse,
@@ -27,6 +28,21 @@ test('节点数据会归一化百分比和秒级时间戳', () => {
   assert.equal(node.memoryUsage, 61)
 })
 
+test('节点 ISO 时间戳在十分钟内会保持在线', () => {
+  const timestamp = Date.parse('2026-09-11T12:00:00.000Z')
+  const node = normalizeNodeResponse({
+    status: 200,
+    data: [{
+      nickname: 'EQAD-003',
+      timestamp: '2026-09-11T12:00:00.000Z',
+      system: { type: 'Windows_NT', cpuUsage: 0.1, memUsage: 0.2 },
+    }],
+  }, timestamp + 9 * 60 * 1000)
+
+  assert.equal(node.status, 'operational')
+  assert.equal(node.timestamp, timestamp)
+})
+
 test('超过十分钟未更新的节点会被标记为离线', () => {
   const node = normalizeNodeResponse({
     status: 200,
@@ -38,6 +54,13 @@ test('超过十分钟未更新的节点会被标记为离线', () => {
   }, 1_800_000_700_001)
 
   assert.equal(node.status, 'outage')
+})
+
+test('节点新鲜度以十分钟为边界，不因 ISO 格式提前判为离线', () => {
+  const timestamp = Date.parse('2026-09-11T12:00:00.000Z')
+  const payload = { status: 200, data: [{ nickname: 'EQAD-003', timestamp: new Date(timestamp).toISOString() }] }
+  assert.equal(normalizeNodeResponse(payload, timestamp + 600000).status, 'operational')
+  assert.equal(normalizeNodeResponse(payload, timestamp + 600001).status, 'outage')
 })
 
 test('Minecraft 在线响应会保留玩家、版本和延迟', () => {
@@ -53,6 +76,59 @@ test('Minecraft 在线响应会保留玩家、版本和延迟', () => {
   assert.equal(minecraft.playersOnline, 12)
   assert.equal(minecraft.playersMax, 80)
   assert.equal(minecraft.latencyMs, 42)
+})
+
+test('Minecraft 探测格式错误不能直接解释为游戏服务离线', () => {
+  for (const payload of [null, {}, { error: 'upstream failed' }, { online: 'true' }]) {
+    assert.throws(() => normalizeMinecraftResponse(payload), /格式异常/)
+  }
+  assert.equal(normalizeMinecraftResponse({ online: false }).status, 'outage')
+})
+
+function mockServiceFetch(t: TestContext) {
+  return t.mock.method(globalThis, 'fetch', async (input: string | URL, init: RequestInit) => {
+    const url = String(input)
+    if (url === 'https://mcyzw.top/') return new Response('<html></html>', { headers: { 'Content-Type': 'text/html' } })
+    if (url === 'https://api.mcyzw.top/api/activities') return Response.json([])
+    if (url === 'https://assets.mcyzw.top/images/logocircle.webp') return new Response('image', { headers: { 'Content-Type': 'image/webp' } })
+    if (url === 'https://mailservice.mcyzw.top/health') return Response.json({ ok: true })
+    if (url === 'https://api.eqad.fun/mcsm/api/services/') {
+      const headers = new Headers(init.headers)
+      const fresh = init.cache === 'no-store' && headers.get('Cache-Control') === 'no-cache'
+      return Response.json({ status: 200, data: [{
+        nickname: 'EQAD-003',
+        // Reproduce the live discrepancy: cached edge data is old, origin is fresh.
+        timestamp: new Date(Date.now() - (fresh ? 1000 : 40 * 60000)).toISOString(),
+        system: { type: 'Windows_NT', cpuUsage: 0.12, memUsage: 0.66 },
+      }] })
+    }
+    throw new Error(`Unexpected dependency: ${url}`)
+  })
+}
+
+test('完整采集接受活动空数组并绕过旧节点缓存，Minecraft 不再依赖 craftping', async (t) => {
+  const http = mockServiceFetch(t)
+  const snapshot = await collectStatusSnapshot(async (host, port) => {
+    assert.equal(host, 'play.mcyzw.top')
+    assert.equal(port, 25565)
+    return { online: true, version: '26.2', protocol: 776, players: { online: 0, max: 20 }, round_trip_latency: 985 }
+  })
+  assert.equal(snapshot.overall, 'operational')
+  assert.equal(snapshot.services.length, 4)
+  assert.ok(snapshot.services.every((service) => service.status === 'operational'))
+  assert.equal(snapshot.node.status, 'operational')
+  assert.equal(snapshot.minecraft.online, true)
+  assert.equal(http.mock.callCount(), 5)
+})
+
+test('Minecraft 检测超时只影响该项，不把其他正常服务连带标为离线', async (t) => {
+  mockServiceFetch(t)
+  const snapshot = await collectStatusSnapshot(async () => { throw new DOMException('timeout', 'TimeoutError') })
+  assert.equal(snapshot.overall, 'degraded')
+  assert.ok(snapshot.services.every((service) => service.status === 'operational'))
+  assert.equal(snapshot.node.status, 'operational')
+  assert.equal(snapshot.minecraft.status, 'unknown')
+  assert.equal(snapshot.errors.minecraft, '响应超时')
 })
 
 test('历史数据按时间排序并过滤无效记录', () => {
@@ -176,6 +252,30 @@ test('上游 5xx 时会重试并返回后续成功响应', async () => {
   }
 })
 
+test('HTTP 头已返回但 JSON 响应体卡住时仍会超时重试并结束采集', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let attempts = 0
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init: RequestInit) => {
+    attempts += 1
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('['))
+        init.signal?.addEventListener('abort', () => controller.error(init.signal?.reason), { once: true })
+      },
+    }))
+  })
+  const result = fetchWithRetry('https://status.example.test', {}, (response) => response.json())
+  const rejection = assert.rejects(result, { name: 'AbortError' })
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  t.mock.timers.tick(4000)
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  t.mock.timers.tick(150)
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  t.mock.timers.tick(4000)
+  await rejection
+  assert.equal(attempts, 2)
+})
+
 test('单次瞬时失败会沿用最近一次成功状态并标记过期', () => {
   const previous: any = {
     generatedAt: 1_800_000_000_000,
@@ -224,4 +324,13 @@ test('单次瞬时失败会沿用最近一次成功状态并标记过期', () =>
   assert.equal(persistent.services[0]?.status, 'outage')
   assert.equal(persistent.node.status, 'unknown')
   assert.equal(persistent.minecraft.status, 'unknown')
+
+  const partial = recoverTransientFailures(current, {
+    ...previous,
+    minecraft: current.minecraft,
+  }, 1_800_000_030_000)
+  assert.equal(partial.node.status, 'operational')
+  assert.equal(partial.errors.node, undefined)
+  assert.equal(partial.minecraft.status, 'unknown')
+  assert.equal(partial.errors.minecraft, '响应超时')
 })

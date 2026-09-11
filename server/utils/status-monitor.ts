@@ -14,9 +14,9 @@ import {
   historyPoints,
   saveStatusSnapshot,
 } from './status-db.ts'
+import { probeMinecraftStatus } from './minecraft-probe.ts'
 
 const NODE_SERVICES_URL = 'https://api.eqad.fun/mcsm/api/services/'
-const MINECRAFT_STATUS_URL = 'https://mcyzw.top/api/craftping/get_status'
 const NODE_NAME = 'EQAD-003'
 const MINECRAFT_HOST = 'play.mcyzw.top'
 const MINECRAFT_PORT = 25565
@@ -111,6 +111,7 @@ function errorMessage(error: unknown, fallback: string): string {
   const name = error instanceof Error ? error.name : ''
   const message = error instanceof Error ? error.message : ''
   if (name === 'TimeoutError' || name === 'AbortError') return '响应超时'
+  if (name === 'SyntaxError') return '服务响应格式异常'
   if (name === 'TypeError') return '无法连接服务'
   if (/^HTTP \d+$/.test(message)) return `返回异常状态 ${message.slice(5)}`
   return fallback
@@ -134,9 +135,12 @@ function wait(milliseconds: number): Promise<void> {
 /**
  * Edge-to-origin connections can fail transiently. Retry only network-like
  * failures and explicitly retryable HTTP statuses, while keeping the whole
- * operation bounded by REQUEST_TIMEOUT_MS.
+ * operation bounded by REQUEST_TIMEOUT_MS. A reader keeps the timeout active
+ * while JSON bodies and validators are still being consumed.
  */
-export async function fetchWithRetry(url: string, init: RequestInit = {}): Promise<Response> {
+export function fetchWithRetry(url: string, init?: RequestInit): Promise<Response>
+export function fetchWithRetry<T>(url: string, init: RequestInit, read: (response: Response) => Promise<T>): Promise<T>
+export async function fetchWithRetry<T>(url: string, init: RequestInit = {}, read?: (response: Response) => Promise<T>): Promise<Response | T> {
   const attemptTimeout = Math.max(1, Math.floor((REQUEST_TIMEOUT_MS - RETRY_DELAY_MS) / REQUEST_ATTEMPTS))
   let lastError: unknown = new Error('请求失败')
 
@@ -148,7 +152,9 @@ export async function fetchWithRetry(url: string, init: RequestInit = {}): Promi
         ...init,
         signal: controller.signal,
       })
-      if (attempt === REQUEST_ATTEMPTS - 1 || !retryableStatus(response.status)) return response
+      if (attempt === REQUEST_ATTEMPTS - 1 || !retryableStatus(response.status)) {
+        return read ? await read(response) : response
+      }
       lastError = new Error(`HTTP ${response.status}`)
       if (response.body && !response.body.locked) void response.body.cancel()
     } catch (error) {
@@ -164,16 +170,21 @@ export async function fetchWithRetry(url: string, init: RequestInit = {}): Promi
 }
 
 async function requestJson(url: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetchWithRetry(url, {
+  return fetchWithRetry(url, {
     ...init,
     headers: {
       Accept: 'application/json',
       'User-Agent': 'YouzaiWorld-ServiceStatus/1.0',
       ...init?.headers,
     },
+  }, async (response) => {
+    try {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return await response.json()
+    } finally {
+      if (response.body && !response.body.locked) void response.body.cancel()
+    }
   })
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  return response.json()
 }
 
 export function normalizeNodeResponse(payload: unknown, now = Date.now()): NodeStatus {
@@ -199,6 +210,7 @@ export function normalizeNodeResponse(payload: unknown, now = Date.now()): NodeS
 
 export function normalizeMinecraftResponse(payload: unknown): MinecraftStatus {
   const raw = payload as any
+  if (!raw || typeof raw.online !== 'boolean') throw new Error('Minecraft 状态响应格式异常')
   const online = raw?.online === true
   const latency = finiteNumber(raw?.round_trip_latency ?? raw?.delay)
   const status: StatusTone = online
@@ -255,16 +267,20 @@ async function checkService(definition: ServiceDefinition): Promise<ServiceStatu
   let response: Response | null = null
   try {
     response = await fetchWithRetry(definition.url, {
+      cache: 'no-store',
       headers: {
         Accept: '*/*',
         'User-Agent': 'YouzaiWorld-ServiceStatus/1.0',
+        'Cache-Control': 'no-cache',
       },
       redirect: 'follow',
+    }, async (result) => {
+      response = result
+      if (!result.ok) throw new Error(`HTTP ${result.status}`)
+      if (definition.validate && !await definition.validate(result)) throw new Error('服务响应格式异常')
+      return result
     })
     const latencyMs = Math.max(0, Math.round(performance.now() - startedAt))
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const valid = definition.validate ? await definition.validate(response) : true
-    if (!valid) throw new Error('invalid response')
     const status = latencyMs > DEGRADED_LATENCY_MS ? 'degraded' : 'operational'
     return {
       ...publicDefinition,
@@ -281,7 +297,7 @@ async function checkService(definition: ServiceDefinition): Promise<ServiceStatu
       latencyMs: null,
       httpStatus: response?.status ?? null,
       checkedAt,
-      message: errorMessage(error, '无法连接服务'),
+      message: errorMessage(error, error instanceof Error && error.message === '服务响应格式异常' ? error.message : '无法连接服务'),
     }
   } finally {
     if (response?.body && !response.body.locked) void response.body.cancel()
@@ -366,8 +382,8 @@ export function recoverTransientFailures(
 
   if (!recovered) return snapshot
   const errors = { ...snapshot.errors }
-  delete errors.node
-  delete errors.minecraft
+  if (node !== snapshot.node) delete errors.node
+  if (minecraft !== snapshot.minecraft) delete errors.minecraft
   errors.worker = `本次检测存在瞬时网络失败，已沿用最近一次成功状态：${recoveredNames.join('、')}`
   return {
     ...snapshot,
@@ -380,15 +396,17 @@ export function recoverTransientFailures(
   }
 }
 
-async function collectStatusSnapshot(): Promise<StatusSnapshot> {
+export async function collectStatusSnapshot(minecraftProbe = probeMinecraftStatus): Promise<StatusSnapshot> {
   const [services, nodeResult, minecraftResult] = await Promise.all([
     settle(Promise.all(SERVICE_DEFINITIONS.map(checkService))),
-    settle(requestJson(NODE_SERVICES_URL)),
-    settle(requestJson(MINECRAFT_STATUS_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ host: MINECRAFT_HOST, port: MINECRAFT_PORT }),
+    settle(requestJson(NODE_SERVICES_URL, {
+      cache: 'no-store',
+      headers: {
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+      },
     })),
+    settle(minecraftProbe(MINECRAFT_HOST, MINECRAFT_PORT, { timeoutMs: REQUEST_TIMEOUT_MS })),
   ])
 
   const checkedServices = services.ok ? services.value : []
@@ -416,7 +434,7 @@ async function collectStatusSnapshot(): Promise<StatusSnapshot> {
     if (!minecraftResult.ok) throw minecraftResult.error
     minecraft = normalizeMinecraftResponse(minecraftResult.value)
   } catch (error) {
-    errors.minecraft = errorMessage(error, 'Minecraft 状态暂不可用')
+    errors.minecraft = errorMessage(error, error instanceof Error ? error.message : 'Minecraft 状态暂不可用')
     minecraft = {
       address: `${MINECRAFT_HOST}:${MINECRAFT_PORT}`,
       status: 'unknown',
@@ -462,6 +480,7 @@ export async function getStatusSnapshot(force = false, source?: unknown): Promis
         await saveStatusSnapshot(snapshot, source)
         displaySnapshot.history = historyPoints(await getStatusHistory(source, 24), MAX_HISTORY_POINTS)
       } catch (error) {
+        console.warn('[service-status] 状态历史存储失败', error instanceof Error ? error.message : String(error))
         displaySnapshot.errors.storage = errorMessage(error, '状态历史存储暂不可用')
         displaySnapshot.history = historyPoints(getMemoryStatusHistory(24), MAX_HISTORY_POINTS)
       }
