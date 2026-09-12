@@ -110,7 +110,7 @@ test('完整采集接受活动空数组并绕过旧节点缓存，Minecraft 不�
   const http = mockServiceFetch(t)
   const snapshot = await collectStatusSnapshot(async (host, port) => {
     assert.equal(host, 'play.mcyzw.top')
-    assert.equal(port, 25565)
+    assert.equal(port, 25703)
     return { online: true, version: '26.2', protocol: 776, players: { online: 0, max: 20 }, round_trip_latency: 985 }
   })
   assert.equal(snapshot.overall, 'operational')

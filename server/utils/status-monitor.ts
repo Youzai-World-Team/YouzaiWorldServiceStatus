@@ -19,7 +19,7 @@ import { probeMinecraftStatus } from './minecraft-probe.ts'
 const NODE_SERVICES_URL = 'https://api.eqad.fun/mcsm/api/services/'
 const NODE_NAME = 'EQAD-003'
 const MINECRAFT_HOST = 'play.mcyzw.top'
-const MINECRAFT_PORT = 25565
+const MINECRAFT_PORT = 25703
 const MAX_HISTORY_POINTS = 96
 const REQUEST_TIMEOUT_MS = 8_000
 const REQUEST_ATTEMPTS = 2

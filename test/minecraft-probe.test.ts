@@ -52,7 +52,7 @@ test('真实 SRV 响应会连接目标端口，保留原始握手域名并解析
     assert.equal(init.cache, 'no-store')
     return Response.json({ Status: 0, Answer: [
       { type: 33, data: '100 0 52531 frp-top.com.' },
-      { type: 33, data: '200 0 25565 standby.example.test.' },
+      { type: 33, data: '200 0 25703 standby.example.test.' },
     ] })
   })
   const socket = new FakeSocket()
@@ -60,7 +60,7 @@ test('真实 SRV 响应会连接目标端口，保留原始握手域名并解析
     const packet = responsePacket()
     for (const part of [packet.subarray(0, 1), packet.subarray(1, 3), packet.subarray(3, 17), packet.subarray(17)]) connection.emit('data', part)
   }
-  const result = await probeMinecraftStatus('play.mcyzw.top', 25565, {
+  const result = await probeMinecraftStatus('play.mcyzw.top', 25703, {
     connectSocket: (endpoint) => {
       assert.deepEqual(endpoint, { host: 'frp-top.com', port: 52531 })
       return socket.connect()
@@ -80,9 +80,9 @@ for (const dns of [{ Status: 0 }, { Status: 3 }]) {
     t.mock.method(globalThis, 'fetch', async () => Response.json(dns))
     const socket = new FakeSocket()
     socket.reply = (connection) => connection.emit('data', responsePacket())
-    await probeMinecraftStatus('play.example.test', 25565, {
+    await probeMinecraftStatus('play.example.test', 25703, {
       connectSocket: (endpoint) => {
-        assert.deepEqual(endpoint, { host: 'play.example.test', port: 25565 })
+        assert.deepEqual(endpoint, { host: 'play.example.test', port: 25703 })
         return socket.connect()
       },
     })
@@ -93,7 +93,7 @@ for (const dns of [{ Status: 2 }, { Status: 0, Answer: [{ type: 33, data: '0 0 0
   test(`DNS 失败或 SRV 无效时不错误连接默认端口：${JSON.stringify(dns)}`, async (t) => {
     t.mock.method(globalThis, 'fetch', async () => Response.json(dns))
     let connected = false
-    await assert.rejects(probeMinecraftStatus('play.example.test', 25565, {
+    await assert.rejects(probeMinecraftStatus('play.example.test', 25703, {
       connectSocket: () => { connected = true; return new FakeSocket().connect() },
     }), /DNS|SRV/)
     assert.equal(connected, false)
@@ -104,7 +104,7 @@ test('SRV 查询超时会在总时限结束时退出', async (t) => {
   t.mock.method(globalThis, 'fetch', (_input: unknown, init: RequestInit) => new Promise((_resolve, reject) => {
     init.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
   }))
-  await assert.rejects(probeMinecraftStatus('play.example.test', 25565, { timeoutMs: 30 }), { name: 'TimeoutError' })
+  await assert.rejects(probeMinecraftStatus('play.example.test', 25703, { timeoutMs: 30 }), { name: 'TimeoutError' })
 })
 
 test('TCP 已连接但不返回状态时会超时并关闭连接', async (t) => {
@@ -123,7 +123,7 @@ test('连接在完整响应前关闭时不会标记在线', async () => {
     connection.emit('data', responsePacket().subarray(0, 10))
     connection.destroy()
   }
-  await assert.rejects(probeMinecraftStatus('127.0.0.1', 25565, {
+  await assert.rejects(probeMinecraftStatus('127.0.0.1', 25703, {
     connectSocket: () => socket.connect(),
   }), /返回状态前关闭/)
 })
@@ -138,7 +138,7 @@ for (const [name, packet] of [
   test(`${name}不会被当作 Minecraft 在线响应`, async () => {
     const socket = new FakeSocket()
     socket.reply = (connection) => connection.emit('data', packet)
-    await assert.rejects(probeMinecraftStatus('127.0.0.1', 25565, {
+    await assert.rejects(probeMinecraftStatus('127.0.0.1', 25703, {
       connectSocket: () => socket.connect(),
     }))
     assert.equal(socket.destroyed, true)

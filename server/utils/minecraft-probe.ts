@@ -21,7 +21,7 @@ export interface MinecraftProbeResult {
 }
 
 async function resolveEndpoint(host: string, port: number, signal: AbortSignal): Promise<MinecraftEndpoint> {
-  if (port !== 25565 || isIP(host)) return { host, port }
+  if (port !== 25703 || isIP(host)) return { host, port }
   const url = new URL(DNS_URL)
   url.searchParams.set('name', `_minecraft._tcp.${host}`)
   url.searchParams.set('type', 'SRV')
@@ -33,7 +33,7 @@ async function resolveEndpoint(host: string, port: number, signal: AbortSignal):
   if (!response.ok) throw new Error(`Minecraft DNS 查询返回 HTTP ${response.status}`)
   const payload = await response.json() as { Status?: number; Answer?: Array<{ type?: number; data?: string }> }
   // Only a successful negative DNS answer permits the default host/port.
-  // A DNS failure must not silently probe port 25565 when an SRV record exists.
+  // A DNS failure must not silently probe port 25703 when an SRV record exists.
   if (payload.Status === 3) return { host, port }
   if (payload.Status !== 0) throw new Error('Minecraft DNS 查询失败')
   const answers = payload.Answer?.filter((answer) => answer.type === 33) ?? []
@@ -161,7 +161,7 @@ async function queryStatus(
 }
 
 /** Query the same SRV destination as a Java client, within one DNS + TCP deadline. */
-export async function probeMinecraftStatus(host: string, port = 25565, options: ProbeOptions = {}): Promise<MinecraftProbeResult> {
+export async function probeMinecraftStatus(host: string, port = 25703, options: ProbeOptions = {}): Promise<MinecraftProbeResult> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new DOMException('Minecraft 直连检测超时', 'TimeoutError')), options.timeoutMs ?? 8000)
   const started = performance.now()
