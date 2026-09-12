@@ -166,7 +166,7 @@ test('部分服务异常时总体状态为部分异常', () => {
     message: '',
   }
   const minecraft: MinecraftStatus = {
-    address: 'play.mcyzw.top:25565',
+    address: 'play.mcyzw.top:25703',
     status: 'operational',
     online: true,
     playersOnline: 1,
@@ -196,7 +196,7 @@ test('五分钟样本会聚合为覆盖完整区间的图表点', () => {
       message: '',
     },
     minecraft: {
-      address: 'play.mcyzw.top:25565',
+      address: 'play.mcyzw.top:25703',
       status: 'operational' as const,
       online: true,
       playersOnline: 1,
@@ -290,7 +290,7 @@ test('单次瞬时失败会沿用最近一次成功状态并标记过期', () =>
       systemType: 'Linux', cpuUsage: 10, memoryUsage: 20, message: '运行正常',
     },
     minecraft: {
-      address: 'play.mcyzw.top:25565', status: 'operational', online: true,
+      address: 'play.mcyzw.top:25703', status: 'operational', online: true,
       playersOnline: 1, playersMax: 80, version: '1.21.8', protocol: '772', latencyMs: 30, message: '服务在线',
     },
     history: [],

@@ -28,7 +28,7 @@ function snapshot(time = Date.now()): StatusSnapshot {
   return {
     generatedAt: time, refreshAfterMs: 60000, overall: 'operational', services: [], history: [], errors: {},
     node: { name: 'EQAD-003', status: 'operational', timestamp: time, systemType: 'Windows_NT', cpuUsage: 10, memoryUsage: 20, message: '运行正常' },
-    minecraft: { address: 'play.mcyzw.top:25565', status: 'operational', online: true, playersOnline: 0, playersMax: 20, version: '26.2', protocol: '776', latencyMs: 50, message: '服务在线' },
+    minecraft: { address: 'play.mcyzw.top:25703', status: 'operational', online: true, playersOnline: 0, playersMax: 20, version: '26.2', protocol: '776', latencyMs: 50, message: '服务在线' },
   }
 }
 
